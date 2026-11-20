@@ -21,11 +21,14 @@ import com.nvidia.nvct.configuration.staticclientauth.FixedBearerExchangeFilterF
 import com.nvidia.nvct.configuration.staticclientauth.StaticClientAuthConfiguration.StaticClientRevalProperties;
 import com.nvidia.nvct.persistence.task.entity.TaskEntity;
 import com.nvidia.nvct.rest.task.dto.GpuSpecificationDto;
+import com.nvidia.nvct.rest.task.dto.ValidationPolicyNameEnum;
 import com.nvidia.nvct.service.registry.RegistryArtifactValidationService;
 import com.nvidia.nvct.service.registry.RegistryCredentialService;
 import com.nvidia.nvct.service.registry.dto.K8sSecretsDto;
 import com.nvidia.nvct.util.NvctOAuth2ClientUtils;
 import com.nvidia.nvct.util.NvctOAuth2ClientUtils.ManagedHttpResources;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -52,6 +55,7 @@ public class RevalClient {
     private static final String MESG_UNKNOWN_VALIDATION_ERROR =
             "Helm chart validation failure. Unknown error.";
     public static final String CLIENT_REGISTRATION_ID = "reval";
+    static final String VALIDATION_POLICY_ID = "task";
 
     private final RevalStubService revalStubService;
     private final boolean enabled;
@@ -131,6 +135,7 @@ public class RevalClient {
                 .configuration(gpuSpec.configuration())
                 .imageRegistryAuthConfig(jsonMapper.valueToTree(imageRegistryAuthConfig))
                 .helmRegistryAuthConfig(jsonMapper.valueToTree(helmRegistryAuthConfig))
+                .validationPolicies(validationPolicies(gpuSpec))
                 .build();
         var response = this.revalStubService.validate(request);
         if (response.getStatusCode().is2xxSuccessful() && response.hasBody()) {
@@ -146,11 +151,12 @@ public class RevalClient {
                 return StringUtils.EMPTY;
             }
 
+            var validationErrors = validationErrors(body);
             String errors;
-            if (CollectionUtils.isEmpty(body.getValidationErrors())) {
+            if (validationErrors.isEmpty()) {
                 errors = MESG_UNKNOWN_VALIDATION_ERROR;
             } else {
-                errors = String.join(", ", body.getValidationErrors());
+                errors = String.join(", ", validationErrors);
             }
 
             var msg = String.format(MESG_HELM_CHART_VALIDATION_ERRORS, errors);
@@ -168,6 +174,40 @@ public class RevalClient {
         }
 
         throw new UpstreamException(msg);
+    }
+
+    // Forward only the task's extra types; submit-time rules stay Default for every policy.
+    static List<RevalStubService.ValidationPolicy> validationPolicies(GpuSpecificationDto gpuSpec) {
+        var policy = gpuSpec.helmValidationPolicy();
+        if (policy == null || policy.extraKubernetesTypes() == null) {
+            return null;
+        }
+        var extraTypes = policy.extraKubernetesTypes().stream()
+                .map(t -> RevalStubService.KubernetesType.builder()
+                        .group(t.group())
+                        .version(t.version())
+                        .kind(t.kind())
+                        .build())
+                .toList();
+        return List.of(RevalStubService.ValidationPolicy.builder()
+                .id(VALIDATION_POLICY_ID)
+                .name(ValidationPolicyNameEnum.DEFAULT.toString())
+                .allowedExtraKubernetesTypes(extraTypes)
+                .build());
+    }
+
+    // With policies, ReVal reports errors per policy instead of at the top level.
+    private static List<String> validationErrors(RevalStubService.RevalValidateResponse body) {
+        var errors = new ArrayList<String>();
+        if (body.getValidationErrors() != null) {
+            errors.addAll(body.getValidationErrors());
+        }
+        if (body.getValidationPolicies() != null) {
+            body.getValidationPolicies().stream()
+                    .filter(p -> p.getValidationErrors() != null)
+                    .forEach(p -> errors.addAll(p.getValidationErrors()));
+        }
+        return errors;
     }
 
     private K8sSecretsDto validateAndGetContainerRegistryImagePullSecrets(TaskEntity task) {
