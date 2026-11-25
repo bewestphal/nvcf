@@ -128,9 +128,9 @@ restored the same way, through an overlay.
 
 | Path | When | What the pod gets | Enforcing code |
 |---|---|---|---|
-| L2 cachedir | The capture's `rox-<hash>` volume is bound | The volume mounted read-only at the cachedir root, the same cache environment as at capture, and `nvsnap-rootfs-restore` as the entrypoint: it reads the tree into the page cache, then runs the recorded entrypoint | `internal/webhook/cachedir.go` `tryL2CacheDir`; `cmd/nvsnap-rootfs-restore` |
+| L2 cachedir | The capture's `rox-<hash>` volume is bound | The volume mounted read-only at the cachedir root, the same cache environment as at capture, a writable copy of the cache subtree made by the `nvsnap-seed-cache` init container, and, when prewarm is on (the storage profile's default, or the pod's `NVSNAP_PREWARM`), an `nvsnap-prewarm` init container that reads the tree into the page cache; the pod's own command is left unchanged | `internal/webhook/cachedir.go` `tryL2CacheDir`, `cacheDirRestorePatches` |
 | L2 overlay (`rootfs` captures) | The `rox-<hash>` volume is bound | One OverlayFS per pod, the volume as the read-only lower and a scratch upper, built by `nvsnap-rootfs-restore`, which then switches the workload's root into it; the Pod object carries one mount however many paths the capture holds | `internal/webhook/rootfs_l2_overlay.go` `tryL2RootfsOverlay`; `cmd/nvsnap-rootfs-restore` |
-| L1 host overlay | No bound `rox-<hash>` volume | The pod is pinned to a node that holds the capture; the agent there builds the overlay mounts in the background while the `nvsnap-mount-prep` init container waits for them, because mount work inside the admission webhook timed out on captures with hundreds of paths | `internal/webhook/mutate.go` `buildPatches`, `nodeAffinityPatches`; `internal/webhook/mount_prep_init.go`; `internal/agent/restore_prep.go` |
+| L1 host overlay | No bound `rox-<hash>` volume | The pod is pinned to a node that holds the capture, and the agent there builds the overlay mounts. By default (`webhook.restorePrepStrategy: inline`) the webhook builds them during admission; with `init-container` the agent builds them in the background while the `nvsnap-mount-prep` init container waits, because mount work inside admission timed out on captures with hundreds of paths | `internal/webhook/mutate.go` `buildPatches`, `nodeAffinityPatches`; `internal/webhook/mount_prep_init.go`; `internal/agent/restore_prep.go` |
 
 Election followers that restore from a capture still being promoted wait in
 the `nvsnap-l2-wait` init container until the server reports the volume
@@ -218,6 +218,35 @@ handles through the agents (`internal/agent/gpushare_fabric.go`).
 
 ![gpushare in nvsnap: admission, capture, the checkpoint, and the restore of a placeholder](figures/nvsnap-gpushare-integration.svg)
 
+RDMA devices block a capture (the preflight's `rdma` check), with one
+exception: a process that maps `libnvsnap_ibv.so`, the verbs library the
+webhook gives NCCL (`webhook.gpushareIBV` or `nvsnap.io/gpushare-ibv`),
+only warns. That library releases NCCL's RDMA state at `release` and
+creates it again at `load`. At `remap`, `nvsnap_ibv_connect` reconnects
+NCCL's queue pairs with their peers' new numbers. When it has queue pairs
+to reconnect, it requires NCCL's verbs calls to be held, and it checks this
+restore's verbs exchange for every one of them before it changes any. It
+fails on any of these:
+
+- a row is missing or does not parse;
+- a key count is missing;
+- two rows conflict;
+- a retry gives other peer numbers.
+
+A refused `remap` keeps the last validated peer table. `nvsnap_ibv_open`,
+and any other release of NCCL's calls, keeps them held until those queue
+pairs are connected. A `remap` that reconnects queue pairs fails when any process in
+the restore that holds queue pairs runs an older library: its `ibvq` rows carry no
+sender token, so `nvsnap_ibv_connect` rejects them as malformed. An older process with
+no queue pairs writes no such rows and does not trigger it; a `remap` with nothing to
+reconnect reads no exchange. RDMA anything else holds (UCX, NIXL) cannot
+be told apart from the host, so the process's own `quiesce` refuses its
+open RDMA files (device files and verbs event files) and its mappings of
+other devices before anything stops, and the workload runs on
+uncaptured. A mapping of a device NCCL also has open, left without a file
+of its own, cannot be told from NCCL's and is not refused: the dump fails
+on it, and the capture rolls back.
+
 The full description, limits and validation are in
 [design/GPUSHARE.md](design/GPUSHARE.md); the sources are under
 `docker/agent/gpushare/`.
@@ -253,6 +282,8 @@ the capture before anything is frozen, each finding naming the process:
   (checkpoint-restore/criu#267), and their state would be useless after a restore (`rdmaDevices`). A ModelExpress
   worker whose GPU tool has `mx-pause` is not blocked: the capture has ModelExpress release them right before the
   suspend, and fails there, before anything is stopped, if any are still held (design/GPUSHARE.md, "ModelExpress").
+  A disaggregated vLLM pod that opts in to `nvsnap.io/nixl-pause`, on a cluster that enables it, is handled the same
+  way for its NIXL KV connector (design/NIXL-PAUSE.md).
 - MPTCP sockets (`IPPROTO_MPTCP`, 262): CRIU cannot dump them (`inet: Unsupported proto 262`). Go 1.24 and later
   open MPTCP listeners by default, so a recent Go service such as a NATS server holds them without asking.
   Setting `GODEBUG=multipathtcp=0` on that service makes it capturable. Support is tracked in
@@ -344,6 +375,14 @@ by a shared read-only attach, depending on the storage
 A node bundle version that a node lacks is fetched from a peer agent and
 installed only when its digest matches the one its staging agents recorded
 (`internal/agent/bundle_digest.go` `verifyBundle`).
+A restore placeholder whose version no agent can supply is given up rather
+than left in FailedMount for good: the restore is recorded as not run, the
+placeholder is deleted, and its checkpoint is blocked (so the replacement
+starts cold) when no node has the version. When the version exists but
+could not be installed on the node, or the capture record no longer names
+it, only the placeholder is deleted
+(`internal/agent/bundle_versions.go` `restoreWithoutBundle`;
+[VERSIONED-NODE-BUNDLE.md](design/VERSIONED-NODE-BUNDLE.md)).
 
 ## 7. Model volumes and the election
 
@@ -458,6 +497,7 @@ keys and request data.
 | No usable capture for a pod's hash | The pod is admitted without a restore and starts cold (under CRIU it is still prepared for a later capture) | `internal/webhook/mutate.go` |
 | A CRIU restore fails, or the restored engine dies | The pod is deleted. Its checkpoint is blocked, and the replacement starts cold, unless the capture is verified and has failures to spare (section 3); then the replacement restores from it again. A failure on a faulty GPU never blocks it ([GPU fault probe](design/GPU-FAULT-PROBE.md)). A pod no controller recreates (a bare pod, or one whose owner does not replace its pods) is kept and starts its workload cold in place instead (below) | `internal/agent/criu_auto_restore.go` `markFailed`, `disposeFailedPlaceholder`; `criu_group.go` `failedRestoreBlocks`, `recordGPUFault`; `restored_watch.go` `failRestored` |
 | The checkpoint could not be fetched | The placeholder is deleted so its replacement tries again; not blocked. A pod nothing recreates starts cold in place | `criu_auto_restore.go` (`errCheckpointUnavailable`) |
+| The node bundle version a placeholder mounts cannot be fetched | When no node has it (every peer says so, or has been down for ten minutes and does not serve it, confirmed two minutes later): the checkpoint is blocked, the restore recorded as not run, and the placeholder (an instance's placeholders) deleted; the replacement starts cold. When the fetch has no final answer for 30 minutes: the same, but the checkpoint is blocked only if no peer served the version and the capture record names it | `internal/agent/bundle_versions.go` `fetchBundle`, `bundleFetchFailed`, `restoreWithoutBundle` |
 | A group restore fails | The group's members are deleted. A restore that failed blocks the group's checkpoints and lets the next Ready instance capture anew, unless the capture is verified and has failures to spare (section 3); a restore that never ran keeps them | `criu_group.go` `failGroup`, `endGroup` (`TestFailGroup_RestoreFailureBlocksAndAllowsRecapture`, `TestFailGroup_StallKeepsCheckpointsAndDeletesEveryRank`) |
 | A capture's namespace is removed while it is being verified | Nothing can verify it. The agents' node sweep (every 10 minutes) finds a `verifying` record whose source namespace is gone or terminating and marks it `abandonedAt` with the reason; the record stays `verifying`, and the function status reports it `abandoned`. The one agent that marks it counts the `abandoned` capture outcome. Not done: the sweep runs only on an agent whose default method is CRIU (`criuIsDefault`), and is skipped in a round where the agent cannot list its node's pods; with no such agent, or until a round succeeds, the record stays `verifying` unmarked | `internal/agent/verify_abandoned.go` `resolveAbandonedVerifies`, `abandonVerify` (run by `gpushare_store_reaper.go` `reapNode`); `internal/fnstatus` `StateAbandoned` |
 | A member ends before the freeze, or a release is not taken | Every member's capture is aborted. Before gpushare's quiesce vote has passed, the instance runs on; after it, the instance's pods are deleted and their replacements start cold | `group_freeze.go` `driveGroupFreeze`; `criu_group.go` `checkpointInstance` (`stopped`), `captureGroup` |
