@@ -183,6 +183,11 @@ type Config struct {
 	// ModelVolume enables the write-once model volume for Helm functions.
 	ModelVolume ModelVolumeConfig
 
+	// NodeModelCache keeps downloaded models on this node's disk and
+	// seeds later cold pods from it (node_model_cache.go). Off by default;
+	// never together with ModelVolume.
+	NodeModelCache NodeModelCacheConfig
+
 	// Rails is the rails tier of EnsureLocal: checkpoint copies between
 	// nodes over their RDMA NICs with bedrock-peer (rails_fetch.go). Off
 	// unless Rails.Image is set.
@@ -330,6 +335,9 @@ type Agent struct {
 	// capturing holds the container IDs with a checkpoint in progress: two
 	// captures of one workload would each suspend it and both fail.
 	capturing sync.Map
+	// leavingIgnored holds the leaving listings admission ignored and
+	// logged (leavingPod), so each is logged once.
+	leavingIgnored sync.Map
 
 	// fabricSessions maps a multi-node gpushare session's pod key to its
 	// directory on this node (see gpushare_fabric.go).
@@ -644,6 +652,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	router.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/verdict", a.fabricVerdictHandler).Methods("PUT")
 	router.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/in", a.fabricInHandler).Methods("PUT")
 	router.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/unlock", a.fabricUnlockHandler).Methods("PUT")
+	router.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/open", a.fabricOpenHandler).Methods("PUT")
 	router.HandleFunc("/v1/gpushare/group-restore", a.groupRestoreHandler).Methods("POST")
 	router.HandleFunc("/v1/restore", a.restoreHandler).Methods("POST")
 	// Instance companions (criu_companion.go): a rank's connections, and
@@ -737,6 +746,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	router.HandleFunc("/v1/restore/prep", a.startRestorePrepHandler).Methods("POST")
 	router.HandleFunc("/v1/restore/prep/{pod-uid}", a.statusRestorePrepHandler).Methods("GET")
 	router.HandleFunc("/v1/restore/prep/{pod-uid}", a.cleanupRestorePrepHandler).Methods("DELETE")
+
+	// Node-local model cache: its peer routes and its controller.
+	a.startNodeModelCache(ctx, router)
 
 	a.server = &http.Server{
 		Addr:              a.config.ListenAddr,
@@ -916,6 +928,10 @@ func (a *Agent) checkpointHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Restore handler
+// restoreForRequest runs a restore: a /v1/restore request's, or an
+// automatic one's (criu_auto_restore.go). A variable for tests.
+var restoreForRequest = (*Agent).restoreProbed
+
 func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	var req RestoreRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -926,7 +942,7 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	metrics.ActiveOperations.WithLabelValues("restore").Inc()
 	start := time.Now()
 
-	result, err := a.restoreProbed(r.Context(), req)
+	result, err := restoreForRequest(a, r.Context(), req)
 
 	metrics.ActiveOperations.WithLabelValues("restore").Dec()
 	duration := time.Since(start).Seconds()
@@ -935,6 +951,21 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		metrics.RestoreTotal.WithLabelValues("failed", workload, "default").Inc()
 		a.log.WithError(err).Error("Restore failed")
+		// A restored engine left taking no requests is disposed of, as the
+		// automatic restores do, rather than left to the caller. A group's
+		// member is its leader's to dispose of. In the background: the
+		// disposal may retry for minutes, and the caller has its answer now.
+		var ns *restoredNotServingError
+		if req.GPUShareFabricSession == "" && errors.As(err, &ns) && ns.Pod != "" {
+			// The restore's marker stays until then: an agent that stops
+			// before the disposal replaces the pod on its next run.
+			go func(ctx context.Context) {
+				if a.disposeFailedPlaceholder(ctx, ns.Namespace, ns.Pod, ns.UID, ns.Container,
+					a.log.WithFields(logrus.Fields{"checkpointId": req.CheckpointID, "pod": ns.Namespace + "/" + ns.Pod})) {
+					releaseNotServing(err)
+				}
+			}(context.WithoutCancel(r.Context()))
+		}
 		writeRestoreFailure(w, err)
 		return
 	}
@@ -1330,11 +1361,20 @@ func (a *Agent) modelVolumeTenantLabel() string {
 // tenantScope names the tenant of namespace ns for content hashes
 // (internal/tenant).
 func (a *Agent) tenantScope(ns string) string {
+	a.bindTenants(a.kubeClient)
+	return a.tenants.Scope(context.Background(), ns)
+}
+
+// bindTenants builds the tenant resolver on kube, once. The first caller
+// with a client binds it: the node model cache starts before the agent
+// has its own client (startRootfsCapture), and calls this with the client
+// it built, so a lookup made before then does not fix the resolver to no
+// client, and every namespace to its own tenant, for the agent's life.
+func (a *Agent) bindTenants(kube kubernetes.Interface) {
 	a.tenantsOnce.Do(func() {
-		a.tenants = &tenant.Resolver{Kube: a.kubeClient, Label: a.config.TenantLabel}
+		a.tenants = &tenant.Resolver{Kube: kube, Label: a.config.TenantLabel}
 		if a.log != nil {
 			a.tenants.Log = a.log.WithField("subsys", "tenant")
 		}
 	})
-	return a.tenants.Scope(context.Background(), ns)
 }
