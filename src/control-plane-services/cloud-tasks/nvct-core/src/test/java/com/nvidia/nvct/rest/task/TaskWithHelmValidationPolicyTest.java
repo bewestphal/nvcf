@@ -308,6 +308,21 @@ class TaskWithHelmValidationPolicyTest {
     }
 
     @Test
+    void shouldNotSendRevalPoliciesWithoutExtraTypes() {
+        var policy = HelmValidationPolicyDto.builder()
+                .name(ValidationPolicyNameEnum.UNRESTRICTED)
+                .build();
+        MockRevalServer.resetRequests();
+
+        var response = createTask(policy, TaskResponse.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var bodies = MockRevalServer.validateRequestBodies();
+        assertThat(bodies).hasSize(1);
+        assertThat(jsonMapper.readTree(bodies.getFirst()).has("validationPolicies")).isFalse();
+    }
+
+    @Test
     void shouldReportPerPolicyRevalErrors() {
         var policy = HelmValidationPolicyDto.builder()
                 .name(ValidationPolicyNameEnum.DEFAULT)

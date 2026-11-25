@@ -55,7 +55,7 @@ public class RevalClient {
     private static final String MESG_UNKNOWN_VALIDATION_ERROR =
             "Helm chart validation failure. Unknown error.";
     public static final String CLIENT_REGISTRATION_ID = "reval";
-    static final String VALIDATION_POLICY_ID = "task";
+    private static final String VALIDATION_POLICY_ID = "task";
 
     private final RevalStubService revalStubService;
     private final boolean enabled;
@@ -177,7 +177,7 @@ public class RevalClient {
     }
 
     // Forward only the task's extra types; submit-time rules stay Default for every policy.
-    static List<RevalStubService.ValidationPolicy> validationPolicies(GpuSpecificationDto gpuSpec) {
+    private static List<RevalStubService.ValidationPolicy> validationPolicies(GpuSpecificationDto gpuSpec) {
         var policy = gpuSpec.helmValidationPolicy();
         if (policy == null || policy.extraKubernetesTypes() == null) {
             return null;
@@ -197,14 +197,14 @@ public class RevalClient {
     }
 
     // A failed policy result rejects the chart even if the top-level flag says valid.
-    static boolean isValid(RevalStubService.RevalValidateResponse body) {
+    private static boolean isValid(RevalStubService.RevalValidateResponse body) {
         return body.isValid() && (body.getValidationPolicies() == null
                 || body.getValidationPolicies().stream()
                         .allMatch(RevalStubService.ValidationPolicyResult::isValid));
     }
 
     // With policies, ReVal reports errors per policy instead of at the top level.
-    static List<String> validationErrors(RevalStubService.RevalValidateResponse body) {
+    private static List<String> validationErrors(RevalStubService.RevalValidateResponse body) {
         var errors = new ArrayList<String>();
         if (body.getValidationErrors() != null) {
             errors.addAll(body.getValidationErrors());
