@@ -37,6 +37,7 @@ import lombok.extern.slf4j.Slf4j;
 public class MockRevalServer {
     public static final String POLICY_REJECTED_KIND = "PolicyRejectedKind";
     public static final String POLICY_REJECTED_ERROR = "policy rejected " + POLICY_REJECTED_KIND;
+    public static final String POLICY_FAILED_SILENTLY_KIND = "PolicyFailedSilentlyKind";
 
     private static WireMockServer wireMockServer;
 
@@ -79,6 +80,20 @@ public class MockRevalServer {
                                  "validationPolicies": [{"id": "task", "valid": false,
                                  "validationErrors": ["%s"]}]}
                                 """.formatted(POLICY_REJECTED_ERROR))));
+        wireMockServer.stubFor(
+                post("/v1/validate")
+                        .atPriority(1)
+                        .withRequestBody(
+                                matchingJsonPath(
+                                        "$.validationPolicies[0].allowedExtraKubernetesTypes[0].kind",
+                                        equalTo(POLICY_FAILED_SILENTLY_KIND)))
+                        .willReturn(aResponse()
+                                .withStatus(200)
+                                .withHeader("Content-Type", "application/json")
+                                .withBody("""
+                                {"valid": true, "validationErrors": [],
+                                 "validationPolicies": [{"id": "task", "valid": false, "validationErrors": []}]}
+                                """)));
         wireMockServer.stubFor(
                 post("/v1/validate")
                         .atPriority(4)

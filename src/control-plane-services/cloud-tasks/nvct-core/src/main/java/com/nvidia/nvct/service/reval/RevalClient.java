@@ -147,7 +147,7 @@ public class RevalClient {
                 log.warn(MESG_REVAL_INTERNAL_ERRORS, internalErrors);
             }
 
-            if (body.isValid()) {
+            if (isValid(body)) {
                 return StringUtils.EMPTY;
             }
 
@@ -196,16 +196,30 @@ public class RevalClient {
                 .build());
     }
 
+    // A failed policy result rejects the chart even if the top-level flag says valid.
+    static boolean isValid(RevalStubService.RevalValidateResponse body) {
+        return body.isValid() && (body.getValidationPolicies() == null
+                || body.getValidationPolicies().stream()
+                        .allMatch(RevalStubService.ValidationPolicyResult::isValid));
+    }
+
     // With policies, ReVal reports errors per policy instead of at the top level.
-    private static List<String> validationErrors(RevalStubService.RevalValidateResponse body) {
+    static List<String> validationErrors(RevalStubService.RevalValidateResponse body) {
         var errors = new ArrayList<String>();
         if (body.getValidationErrors() != null) {
             errors.addAll(body.getValidationErrors());
         }
         if (body.getValidationPolicies() != null) {
-            body.getValidationPolicies().stream()
-                    .filter(p -> p.getValidationErrors() != null)
-                    .forEach(p -> errors.addAll(p.getValidationErrors()));
+            for (var policy : body.getValidationPolicies()) {
+                if (policy.isValid()) {
+                    continue;
+                }
+                if (CollectionUtils.isEmpty(policy.getValidationErrors())) {
+                    errors.add(MESG_UNKNOWN_VALIDATION_ERROR);
+                } else {
+                    errors.addAll(policy.getValidationErrors());
+                }
+            }
         }
         return errors;
     }

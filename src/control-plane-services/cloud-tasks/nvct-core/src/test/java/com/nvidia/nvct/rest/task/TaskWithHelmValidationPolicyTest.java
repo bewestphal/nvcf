@@ -324,6 +324,23 @@ class TaskWithHelmValidationPolicyTest {
         assertThat(response.getBody()).contains(MockRevalServer.POLICY_REJECTED_ERROR);
     }
 
+    @Test
+    void shouldRejectFailedPolicyWithoutErrors() {
+        var policy = HelmValidationPolicyDto.builder()
+                .name(ValidationPolicyNameEnum.DEFAULT)
+                .extraKubernetesTypes(List.of(HelmValidationPolicyDto.KubernetesType.builder()
+                        .group("example.com")
+                        .version("v1")
+                        .kind(MockRevalServer.POLICY_FAILED_SILENTLY_KIND)
+                        .build()))
+                .build();
+
+        var response = createTask(policy, String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).contains("Helm chart validation failure. Unknown error.");
+    }
+
     private <T> ResponseEntity<T> createTask(HelmValidationPolicyDto policy, Class<T> responseType) {
         var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT,
                                                     List.of(SCOPE_LAUNCH_TASK, SCOPE_LIST_TASKS),

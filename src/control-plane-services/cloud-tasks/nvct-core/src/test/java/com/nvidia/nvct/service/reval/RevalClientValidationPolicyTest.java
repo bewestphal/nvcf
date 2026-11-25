@@ -22,6 +22,8 @@ import com.nvidia.nvct.rest.task.dto.GpuSpecificationDto;
 import com.nvidia.nvct.rest.task.dto.HelmValidationPolicyDto;
 import com.nvidia.nvct.rest.task.dto.ValidationPolicyNameEnum;
 import com.nvidia.nvct.service.reval.RevalStubService.KubernetesType;
+import com.nvidia.nvct.service.reval.RevalStubService.RevalValidateResponse;
+import com.nvidia.nvct.service.reval.RevalStubService.ValidationPolicyResult;
 import com.nvidia.nvct.service.reval.RevalStubService.ValidationPolicy;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -73,6 +75,46 @@ class RevalClientValidationPolicyTest {
                 .build();
 
         assertThat(RevalClient.validationPolicies(spec(policy))).containsExactly(defaultPolicyWithWidget());
+    }
+
+    private static ValidationPolicyResult policyResult(boolean valid, List<String> errors) {
+        return ValidationPolicyResult.builder().id("task").valid(valid).validationErrors(errors).build();
+    }
+
+    @Test
+    void testFailedPolicyRejectsEvenWhenTopLevelIsValid() {
+        var body = RevalValidateResponse.builder()
+                .valid(true)
+                .validationPolicies(List.of(policyResult(false, List.of())))
+                .build();
+
+        assertThat(RevalClient.isValid(body)).isFalse();
+        assertThat(RevalClient.validationErrors(body))
+                .containsExactly("Helm chart validation failure. Unknown error.");
+    }
+
+    @Test
+    void testPassingPoliciesKeepTopLevelResult() {
+        var body = RevalValidateResponse.builder()
+                .valid(true)
+                .validationPolicies(List.of(policyResult(true, null)))
+                .build();
+
+        assertThat(RevalClient.isValid(body)).isTrue();
+    }
+
+    @Test
+    void testCollectsTopLevelAndFailedPolicyErrors() {
+        var body = RevalValidateResponse.builder()
+                .valid(false)
+                .validationErrors(List.of("top"))
+                .validationPolicies(List.of(
+                        policyResult(false, List.of("policy")),
+                        policyResult(true, List.of("ignored"))))
+                .build();
+
+        assertThat(RevalClient.isValid(body)).isFalse();
+        assertThat(RevalClient.validationErrors(body)).containsExactly("top", "policy");
     }
 
     @Test
